@@ -1,7 +1,7 @@
 import express from "express";
 import dotenv from "dotenv";
 import axios from "axios";
-import WebSocket from "ws";
+import WebSocket, { WebSocketServer } from "ws";  // <== WICHTIG
 
 dotenv.config();
 
@@ -96,7 +96,8 @@ const server = app.listen(PORT, () => {
   console.log(`🚀 Server läuft auf Port ${PORT}`);
 });
 
-const wss = new WebSocket.Server({ server, path: "/media" });
+// WebSocket-Server für Telnyx Media
+const wss = new WebSocketServer({ server, path: "/media" });
 
 wss.on("connection", async (mediaWS) => {
   console.log("🎤 Telnyx Media WebSocket verbunden");
@@ -131,5 +132,13 @@ wss.on("connection", async (mediaWS) => {
   mediaWS.on("close", () => {
     console.log("❌ Telnyx WS geschlossen");
     openaiWS.close();
+  });
+
+  openaiWS.on("error", (err) => {
+    console.error("OpenAI WS Fehler:", err);
+  });
+
+  mediaWS.on("error", (err) => {
+    console.error("Telnyx Media WS Fehler:", err);
   });
 });
