@@ -1,152 +1,156 @@
-// server.js
 import express from "express";
 import dotenv from "dotenv";
-import { WebSocketServer } from "ws";
+import axios from "axios";
+import WebSocket, { WebSocketServer } from "ws";
 
 dotenv.config();
 
 const app = express();
 app.use(express.json());
 
-// ===== ENV VARS ===================================================
+const PORT = process.env.PORT || 10000;
+
 const {
-  OPENAI_API_KEY,
   TELNYX_API_KEY,
   TELNYX_CONNECTION_ID,
   TELNYX_FROM_NUMBER,
-  RENDER_DOMAIN,
-  PORT = 10000,
+  OPENAI_API_KEY,
+  RENDER_DOMAIN
 } = process.env;
 
-console.log("🚀 Starte Telnyx <-> OpenAI Realtime Bridge");
-console.log("ℹ️  Port:", PORT);
-console.log("ℹ️  Render Domain:", RENDER_DOMAIN);
+console.log("🚀 Server starting with domain:", RENDER_DOMAIN);
 
-// ===== HTTP ENDPOINTS =============================================
-
-// Healthcheck für Render
+// -------------------------------
+// HEALTHCHECK
+// -------------------------------
 app.get("/health", (req, res) => {
-  res.send("ok");
+  res.send("OK");
 });
 
-// Outbound Call starten: /call?to=%2B49123456789
+// -------------------------------
+// OUTBOUND CALL ROUTE
+// -------------------------------
 app.get("/call", async (req, res) => {
   const to = req.query.to;
+  if (!to) return res.json({ ok: false, error: "missing ?to=" });
 
-  if (!to) {
-    return res.status(400).json({
-      ok: false,
-      error: "Missing 'to' query parameter. Use /call?to=%2B49123456789",
-    });
-  }
+  console.log("📞 Starte Outbound Call zu:", to);
 
   try {
-    console.log("📞 Starte Outbound Call zu:", to);
-
-    const createResp = await fetch("https://api.telnyx.com/v2/calls", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${TELNYX_API_KEY}`,
-      },
-      body: JSON.stringify({
+    const telnyxResp = await axios.post(
+      "https://api.telnyx.com/v2/calls",
+      {
         connection_id: TELNYX_CONNECTION_ID,
         to,
         from: TELNYX_FROM_NUMBER,
-        timeout_secs: 45,
-      }),
-    });
 
-    const telnyxData = await createResp.json();
-    console.log("📨 Telnyx Call Response:", JSON.stringify(telnyxData, null, 2));
+        // ------------------------------------
+        // 🔥 HIER aktivieren wir Media Streaming
+        // ------------------------------------
+        stream_url: `wss://${RENDER_DOMAIN}/media`,
+        stream_track: "both_tracks",
+        stream_codec: "PCMU" // ← **WICHTIG: Muss groß sein!**
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${TELNYX_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+      }
+    );
 
-    if (!createResp.ok) {
-      return res.status(500).json({ ok: false, telnyx: telnyxData });
-    }
+    console.log("📡 Telnyx Call Response:", telnyxResp.data);
+    res.json({ ok: true, telnyx: telnyxResp.data });
 
-    return res.json({ ok: true, telnyx: telnyxData });
   } catch (err) {
-    console.error("❌ Fehler beim Starten des Calls:", err);
-    return res.status(500).json({ ok: false, error: err.message });
+    console.error("❌ Fehler beim Outbound Call:", err.response?.data || err);
+    res.json({ ok: false, error: err.response?.data || err });
   }
 });
 
-// Webhook für Telnyx Call Events
-// In Telnyx hast du dafür eingetragen:
-// https://DEIN-RENDER-DOMAIN/telnyx-webhook
-app.post("/telnyx-webhook", async (req, res) => {
-  try {
-    const eventType = req.body.data?.event_type;
-    const payload = req.body.data?.payload;
-    const callControlId = payload?.call_control_id;
+// -------------------------------
+// WEBHOOK: call.answered
+// -------------------------------
+app.post("/webhook", async (req, res) => {
+  const event = req.body.data?.event_type;
+  console.log("📩 Telnyx Webhook Event:", event);
 
-    console.log("📩 Telnyx Webhook Event:", eventType);
+  if (event === "call.answered") {
+    const call_control_id = req.body.data.payload.call_control_id;
+    console.log("📞 call answered – starte Media Stream...");
 
-    // Wenn der Anruf angenommen wurde -> JETZT Media Stream starten
-    if (eventType === "call.answered" && callControlId) {
-      console.log("🎉 Call wurde angenommen – starte Media Stream…");
-
-      try {
-        const resp = await fetch(
-          `https://api.telnyx.com/v2/calls/${callControlId}/actions/streaming_start`,
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${TELNYX_API_KEY}`,
-            },
-            body: JSON.stringify({
-              stream_url: `wss://${RENDER_DOMAIN}/media`,
-              stream_track: "both_tracks",
-              // G.711 μ-law -> kompatibel mit OpenAI g711_ulaw
-              stream_codec: "pcmu",
-            }),
+    try {
+      const startStream = await axios.post(
+        `https://api.telnyx.com/v2/calls/${call_control_id}/actions/streaming_start`,
+        {
+          stream_url: `wss://${RENDER_DOMAIN}/media`,
+          stream_track: "both_tracks",
+          stream_codec: "PCMU"
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${TELNYX_API_KEY}`,
+            "Content-Type": "application/json"
           }
-        );
+        }
+      );
 
-        const json = await resp.json();
-        console.log("🎧 Telnyx streaming_start Response:", json);
-      } catch (err) {
-        console.error("❌ Fehler bei streaming_start:", err);
-      }
+      console.log("🎧 Telnyx streaming_start Response:", startStream.data);
+
+    } catch (err) {
+      console.log("❌ Fehler streaming_start:", err.response?.data || err);
     }
-  } catch (err) {
-    console.error("❌ Fehler im Telnyx Webhook:", err);
   }
 
-  // Telnyx erwartet immer eine Antwort
   res.json({ received: true });
 });
 
-// ===== HTTP SERVER STARTEN ========================================
-const server = app.listen(PORT, () => {
-  console.log(`✅ Server läuft auf Port ${PORT}`);
-});
+// -------------------------------
+// MEDIA STREAM WEBSOCKET
+// -------------------------------
+const wss = new WebSocketServer({ noServer: true });
+let openaiWS = null;
 
-// ===== WEBSOCKET BRIDGE (TELNYX <-> OPENAI) =======================
-const wss = new WebSocketServer({ server });
+wss.on("connection", (ws) => {
+  console.log("🔌 Telnyx Media WebSocket verbunden");
 
-wss.on("connection", (ws, req) => {
-  const path = req.url || "/";
-  console.log("🌐 Neue WebSocket-Verbindung:", path);
+  ws.on("message", async (raw) => {
+    let message;
 
-  if (path.startsWith("/media")) {
-    handleTelnyxMediaStream(ws);
-  } else {
-    console.log("❌ Unbekannter WS-Pfad, Verbindung wird geschlossen.");
-    ws.close();
-  }
-});
+    try {
+      message = JSON.parse(raw);
+    } catch (e) {
+      return console.log("⚠ Ungültiges Telnyx WS Paket");
+    }
 
-// Telnyx Media Stream <-> OpenAI Realtime Audio Bridge
-function handleTelnyxMediaStream(telnyxWs) {
-  console.log("📡 Telnyx Media WebSocket verbunden");
+    // -----------------------
+    // AUDIO FROM CALL → OPENAI
+    // -----------------------
+    if (message.event === "media") {
+      const audioBase64 = message.media.payload;
 
-  let currentStreamId = null;
+      if (openaiWS && openaiWS.readyState === WebSocket.OPEN) {
+        openaiWS.send(JSON.stringify({
+          type: "input_audio_buffer.append",
+          audio: audioBase64
+        }));
+      }
+    }
 
-  // Verbindung zu OpenAI Realtime
-  const openaiWs = new WebSocket(
-    "wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview",
+    if (message.event === "start") {
+      console.log("🎤 Telnyx WS: start", message);
+    }
+  });
+
+  ws.on("close", () => {
+    console.log("🔌 Telnyx WebSocket geschlossen");
+  });
+
+  // ---------------------------
+  // OPENAI REALTIME verbinden
+  // ---------------------------
+  openaiWS = new WebSocket(
+    "wss://api.openai.com/v1/realtime?model=gpt-4o-mini-tts",
     {
       headers: {
         Authorization: `Bearer ${OPENAI_API_KEY}`,
@@ -155,106 +159,48 @@ function handleTelnyxMediaStream(telnyxWs) {
     }
   );
 
-  openaiWs.on("open", () => {
+  openaiWS.on("open", () => {
     console.log("🤖 OpenAI Realtime verbunden");
 
-    const sessionUpdate = {
-      type: "session.update",
-      session: {
-        instructions:
-          "Du bist ein freundlicher Telefonassistent. Sprich kurz, natürlich und hilfsbereit. Sprich immer Deutsch.",
-        input_audio_format: "g711_ulaw",
-        output_audio_format: "g711_ulaw",
-        voice: "alloy",
-        turn_detection: {
-          type: "server_vad",
-        },
-      },
-    };
-
-    openaiWs.send(JSON.stringify(sessionUpdate));
-    console.log("📤 Session-Config an OpenAI gesendet");
+    // Start-Event, damit OpenAI direkt spricht
+    openaiWS.send(JSON.stringify({
+      type: "response.create",
+      response: {
+        instructions: "Du bist ein freundlicher deutscher Telefonassistent.",
+      }
+    }));
   });
 
-  // ========= Telnyx -> OpenAI =========
-  telnyxWs.on("message", (data, isBinary) => {
-    try {
-      if (isBinary) return;
+  // ---------------------------
+  // AUDIO VON OPENAI → CALL
+  // ---------------------------
+  openaiWS.on("message", (msg) => {
+    const event = JSON.parse(msg);
 
-      const msg = JSON.parse(data.toString("utf8"));
+    if (event.type === "response.audio.delta") {
+      const audioChunk = event.delta;
 
-      if (msg.event === "start") {
-        currentStreamId = msg.stream_id;
-        console.log(
-          "▶️ Telnyx Stream gestartet:",
-          msg.start?.media || msg.start
-        );
-      } else if (msg.event === "media" && msg.media?.payload) {
-        // base64 G.711 μ-law Audio von Telnyx
-        const audioB64 = msg.media.payload;
-
-        const openaiEvent = {
-          type: "input_audio_buffer.append",
-          // OpenAI erwartet base64 audio im gleichen Format wie input_audio_format
-          audio: audioB64,
-        };
-        openaiWs.send(JSON.stringify(openaiEvent));
-      } else if (msg.event === "stop") {
-        console.log("⏹ Telnyx Media Stream beendet");
-        openaiWs.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-      }
-    } catch (err) {
-      console.error("❌ Fehler Telnyx->OpenAI:", err);
+      ws.send(JSON.stringify({
+        event: "media",
+        media: { payload: audioChunk }
+      }));
     }
   });
+});
 
-  telnyxWs.on("close", () => {
-    console.log("📴 Telnyx WS geschlossen");
-    openaiWs.close();
-  });
+// -------------------------------
+// UPGRADE (WebSocket Routing)
+// -------------------------------
+const server = app.listen(PORT, () => {
+  console.log(`🚀 Server läuft auf Port ${PORT}`);
+});
 
-  telnyxWs.on("error", (err) => {
-    console.error("❌ Telnyx WS Fehler:", err);
-    openaiWs.close();
-  });
-
-  // ========= OpenAI -> Telnyx =========
-  openaiWs.on("message", (data, isBinary) => {
-    try {
-      if (isBinary) return;
-
-      const msg = JSON.parse(data.toString("utf8"));
-
-      // Audio vom Assistenten
-      if (
-        msg.type === "response.audio.delta" &&
-        msg.delta &&
-        currentStreamId
-      ) {
-        // msg.delta ist base64 G.711 μ-law (g711_ulaw)
-        const outbound = {
-          event: "media",
-          stream_id: currentStreamId,
-          media: { payload: msg.delta },
-        };
-        telnyxWs.send(JSON.stringify(outbound));
-      }
-
-      if (msg.type === "response.completed") {
-        console.log("🗣 OpenAI Antwort fertig");
-      }
-    } catch (err) {
-      console.error("❌ Fehler OpenAI->Telnyx:", err);
-    }
-  });
-
-  openaiWs.on("close", () => {
-    console.log("📴 OpenAI WS geschlossen");
-    telnyxWs.close();
-  });
-
-  openaiWs.on("error", (err) => {
-    console.error("❌ OpenAI WS Fehler:", err);
-    telnyxWs.close();
-  });
-}
+server.on("upgrade", (req, socket, head) => {
+  if (req.url === "/media") {
+    wss.handleUpgrade(req, socket, head, (ws) =>
+      wss.emit("connection", ws, req)
+    );
+  } else {
+    socket.destroy();
+  }
+});
